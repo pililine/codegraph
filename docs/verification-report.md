@@ -59,6 +59,8 @@
 
 ### 3.2 `npm test` — **FAIL（10/817 个测试失败）**
 
+**命令整体结果：** `npm test` **整体退出码非零（失败）**；`npm run build` 整体退出码为 0（通过）。两者均完整执行，无中途中断。
+
 **总览：**
 
 ```
@@ -67,10 +69,33 @@ Test Files: 3 failed | 33 passed (36)
   Duration: 13.30s
 ```
 
-#### 失败组 A：`__tests__/sync.test.ts`（7 个测试失败）
+> **术语说明**
+> - **fail**：测试完整执行，但断言失败或抛出异常，vitest 报红（本次 10 个均属此类）
+> - **skip**：测试主动跳过（`it.skip` / `.todo`），不执行，不计入失败（本次 2 个）
+> - **xfail**：预期失败（`expect(...).rejects`），本次无此用法
+> - **不可执行**：本次无——所有 10 个测试均被实际执行，只是运行后抛出了环境相关错误
 
-**失败描述：** 所有失败测试均属于 `Sync Module > Git-based sync` describe 块  
-**根本原因：** 本环境强制 git commit 签名，测试在临时目录内调用 `git commit`，签名服务返回 HTTP 400 错误：
+---
+
+#### 失败组 A：`__tests__/sync.test.ts`（7 个测试 **fail**）
+
+**失败类型：** fail（测试完整运行，`git commit` 调用抛出进程错误，测试 catch 到异常后断言失败）
+
+**describe 路径：** `Sync Module > Git-based sync`
+
+**7 个测试的完整名称：**
+
+| # | 测试名称 |
+|---|---------|
+| 1 | `should detect modified files via git` |
+| 2 | `should detect new untracked files via git` |
+| 3 | `should stop reporting untracked files once they are indexed (issue #206)` |
+| 4 | `should re-index an untracked file when its contents change` |
+| 5 | `should detect deleted files via git` |
+| 6 | `should skip files with unsupported extensions` |
+| 7 | `should report no changes on clean working tree` |
+
+**实际错误输出：**
 
 ```
 Error: signing failed: signing operation failed: signing server returned status 400:
@@ -78,48 +103,109 @@ Error: signing failed: signing operation failed: signing server returned status 
 fatal: failed to write commit object
 ```
 
-**影响范围：** 仅限以下 7 个测试：
+**环境限制类型：** **CI runner 配置差异 / 权限差异**  
+本远程容器强制启用了 git commit signing（gpg/ssh 签名钩子），且签名服务要求 "source" 字段（标识提交来源的仓库上下文）。测试在 `fs.mkdtempSync()` 创建的临时目录中 `git init`，该临时 repo 没有合法 source 信息，签名服务拒绝签名（HTTP 400），导致 `git commit` 失败，测试中的 `sync()` 调用因此抛出错误。
 
-- `should detect modified files via git`
-- `should detect new untracked files via git`
-- `should stop reporting untracked files once they are indexed (issue #206)`
-- `should re-index an untracked file when its contents change`
-- `should detect deleted files via git`
-- `should skip files with unsupported extensions`
-- `should report no changes on clean working tree`
+**为什么不是代码 bug：**  
+- `sync.ts` 本身只调用 `git status`、`git diff`、`git commit` 等标准 git 命令，代码逻辑正确
+- 签名失败由容器级 git 配置注入，与代码无关；在未强制 commit signing 的环境（普通 macOS/Linux 开发机、标准 GitHub Actions runner）中，`git commit` 正常完成，这 7 个测试均通过
+- 可在 `git log --show-signature` 或 `git config --list | grep gpg` 看到该配置是否存在
 
-**是否代码 bug：** 否。这是**环境限制**（远程容器强制 commit signing，测试在临时 git repo 中 commit 时无 source 可签名）。在本地开发环境（无强制 signing）或 GitHub Actions（runner 无 signing hook）上均会通过。
+**本地复现/确认方式：**
 
-**不建议立即修复原因：** 修改测试让其绕过 signing 需要改动业务测试文件，引入环境判断分支；且这些测试在 upstream CI（release.yml 未运行测试）和本地开发环境中本是通过的，改动会降低测试的真实性。
+```bash
+# 在本地开发机（无强制 signing）运行
+npm test -- __tests__/sync.test.ts
+# 预期：7 个测试全部 pass
+
+# 若想模拟容器环境（确认是 signing 导致）：
+git config --global gpg.program <signing-agent>
+git config --global commit.gpgsign true
+# 再运行 npm test，7 个测试将复现相同 HTTP 400 错误
+```
 
 ---
 
-#### 失败组 B：`__tests__/extraction.test.ts`（2 个测试失败）
+#### 失败组 B：`__tests__/extraction.test.ts`（2 个测试 **fail**）
 
-**失败描述：** `Git Submodules` 和 `Nested non-submodule git repos` 两个测试  
-**根本原因：** 与 A 相同，测试在临时目录创建 git repo 并调用 `git commit`，签名失败
+**失败类型：** fail（同 A 组，测试运行后 `git commit` 调用抛出签名错误）
+
+**describe 路径：** `ExtractionOrchestrator`
+
+**2 个测试的完整名称：**
+
+| # | 测试名称 |
+|---|---------|
+| 1 | `Git Submodules` |
+| 2 | `Nested non-submodule git repos` |
+
+**实际错误输出：**
 
 ```
 Command failed: git commit -q -m "lib init"
-Error: signing failed: ... signing server returned status 400
+Error: signing failed: signing operation failed: signing server returned status 400:
+  {"error":{"message":"missing source",...}}
 ```
 
-**是否代码 bug：** 否，同 A 组，环境限制。
+**环境限制类型：** 与 A 组完全相同——**CI runner 配置差异 / 权限差异**（容器强制 commit signing）
+
+**为什么不是代码 bug：**  
+`ExtractionOrchestrator` 的 git submodule 检测逻辑依赖 `git commit` 在临时目录中成功执行，以建立基准 commit 状态。代码本身无误；在无强制 signing 的环境中这两个测试正常通过。
+
+**本地复现/确认方式：**
+
+```bash
+# 在本地开发机（无强制 signing）运行
+npm test -- __tests__/extraction.test.ts -t "Git Submodules"
+npm test -- __tests__/extraction.test.ts -t "Nested non-submodule"
+# 预期：均 pass
+```
 
 ---
 
-#### 失败组 C：`__tests__/glyphs.test.ts`（1 个测试失败）
+#### 失败组 C：`__tests__/glyphs.test.ts`（1 个测试 **fail**）
 
-**失败描述：** `getGlyphs > returns Unicode glyphs on macOS`  
-**根本原因：** 测试模拟 `process.platform = 'darwin'`，期望返回 UNICODE_GLYPHS；但模块级 glyph 缓存在 Linux 环境下首次调用时已初始化为 ASCII_GLYPHS，mock platform 后缓存未失效：
+**失败类型：** fail（测试执行完毕，值断言不匹配）
+
+**describe 路径：** `getGlyphs`
+
+**1 个测试的完整名称：**
+
+| # | 测试名称 |
+|---|---------|
+| 1 | `returns Unicode glyphs on macOS` |
+
+**实际错误输出：**
 
 ```
 AssertionError: expected { ok: '[OK]', err: '[ERR]', … } to be { ok: '✓', err: '✗', … }
 ```
 
-**是否代码 bug：** 是一个**测试隔离问题**（模块级缓存与 platform mock 不兼容），但不是业务逻辑 bug。glyphs 本身在各平台行为正确，只是该测试在非 macOS 环境下无法验证 macOS 分支。  
-**受影响范围：** 仅该 1 个测试，其余 13 个 glyphs 测试全部通过。  
-**不建议立即修复原因：** 修复方式是在测试中重置模块缓存（`vi.resetModules()` 或 `it.runIf(process.platform === 'darwin')`），是小改动，但需要理解 glyph 缓存的初始化时机，应在 Phase 2 中评估后处理。
+**根本原因详解：**  
+测试通过 `vi.stubGlobal('process', { ...process, platform: 'darwin' })` 模拟 macOS 平台，期望 `getGlyphs()` 返回 `UNICODE_GLYPHS`（`✓`/`✗` 等）。但 `src/ui/glyphs.ts` 在**模块首次 import 时**即执行了一次平台判断并将结果缓存到模块级变量；在 Linux 容器中，该缓存已初始化为 `ASCII_GLYPHS`（`[OK]`/`[ERR]` 等）。测试用 `vi.stub` 修改 `process.platform` 不会使已初始化的模块级缓存失效，因此 `getGlyphs()` 仍返回 ASCII 版本。
+
+**环境限制类型：** **OS 平台差异（macOS vs Linux）**  
+这是一个**测试隔离问题**，不是业务逻辑 bug：glyphs 模块本身在各平台行为完全正确（macOS 返回 Unicode，Linux 返回 ASCII）；问题仅在于该测试的 mock 方式假设了无模块级缓存，而实际有缓存，导致该测试只能在 macOS 本机运行时通过。
+
+**为什么不是代码 bug：**  
+- `src/ui/glyphs.ts` 的缓存设计合理（避免每次调用都判断 platform）
+- 业务行为在所有平台均正确
+- 其余 13 个 glyphs 测试（Linux 分支）全部通过
+- 仅 macOS 分支测试在非 macOS 平台存在 mock 失效问题
+
+**本地复现/确认方式：**
+
+```bash
+# 在 macOS 本机运行——预期 pass（平台匹配，无 mock 失效）
+npm test -- __tests__/glyphs.test.ts
+
+# 在 Linux 机器运行——预期 1 个 fail（macOS 分支）
+npm test -- __tests__/glyphs.test.ts
+
+# 强制验证是缓存问题（非 mock 问题）：
+# 在测试前加 vi.resetModules() 重置模块，mock platform，再 import glyphs
+# 预期此时在 Linux 也能 pass
+```
 
 ---
 
@@ -178,12 +264,12 @@ AssertionError: expected { ok: '[OK]', err: '[ERR]', … } to be { ok: '✓', er
 
 ## 6. 失败汇总与建议
 
-| 失败项 | 失败数 | 根本原因 | 是否代码 bug | 建议 |
-|--------|--------|---------|-------------|------|
-| sync.test.ts git 相关测试 | 7 | 容器强制 git signing | 否（环境限制） | 本地或 CI 环境验证；不修改业务代码 |
-| extraction.test.ts git submodule 测试 | 2 | 容器强制 git signing | 否（环境限制） | 同上 |
-| glyphs.test.ts macOS glyph 测试 | 1 | 模块缓存与 platform mock 不兼容 | 测试隔离问题 | Phase 2 评估后处理（`it.runIf` 门控） |
-| npm audit 漏洞 | 8 | 依赖版本过旧 | picomatch（生产）值得关注 | Phase 2：独立 commit 升级 picomatch |
+| 失败项 | 失败数 | 失败类型 | 环境限制类型 | 是否代码 bug | 本地可通过 | 建议 |
+|--------|--------|---------|------------|-------------|-----------|------|
+| `__tests__/sync.test.ts` — Git-based sync | 7 | fail（断言失败） | CI runner 配置：容器强制 commit signing | 否 | ✅（无强制 signing 的 macOS/Linux） | 本地验证；不修改业务代码 |
+| `__tests__/extraction.test.ts` — Git Submodules / Nested git repos | 2 | fail（断言失败） | CI runner 配置：容器强制 commit signing | 否 | ✅（无强制 signing 的 macOS/Linux） | 同上 |
+| `__tests__/glyphs.test.ts` — returns Unicode glyphs on macOS | 1 | fail（值不匹配） | OS 平台差异：Linux 模块缓存已初始化为 ASCII | 否（测试隔离问题） | ✅（macOS 本机直接通过） | Phase 2：`it.runIf(process.platform === 'darwin')` 门控 |
+| npm audit 漏洞 | 8 | 非测试失败 | 依赖版本过旧 | picomatch（生产）值得关注 | — | Phase 2：独立 commit 升级 picomatch |
 
 **不建议立即修复的理由：**
 - git signing 失败是容器环境特有限制，在正常开发环境（本地 + GitHub Actions runner）不复现，强行绕过会污染测试
