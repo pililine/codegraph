@@ -34,7 +34,7 @@
 |------|------|
 | 语言 | TypeScript（strict 模式，ES2022 target，CommonJS 输出） |
 | 解析器 | [web-tree-sitter](https://github.com/tree-sitter/tree-sitter) + WASM grammars |
-| 数据库 | SQLite via `better-sqlite3`（原生）/ `node-sqlite3-wasm`（WASM 降级） |
+| 数据库 | SQLite via `node:sqlite`（Node.js 内置，v0.9.4 起；原 `better-sqlite3` + WASM 降级路径已在 commit `ac52fd7` 中移除） |
 | 全文检索 | SQLite FTS5 virtual table |
 | CLI 框架 | [commander](https://github.com/tj/commander.js) |
 | 测试框架 | [vitest](https://vitest.dev/) |
@@ -432,9 +432,8 @@ FTS5 虚拟表 `nodes_fts`（字段：name, qualified_name, docstring, signature
 | `fast-wrap-ansi` | ^0.2.0 | ANSI 转义序列感知换行 |
 | `sisteransi` | ^1.0.5 | ANSI 检测与处理 |
 
-**可选原生依赖（运行时动态加载）：**
-- `better-sqlite3`（原生 Node 绑定，性能优先）
-- 降级：`node-sqlite3-wasm`（纯 WASM，零编译，性能略低）
+**内置 SQLite（v0.9.4 起）：**  
+使用 Node.js `node:sqlite` 内置模块，无需外部绑定。原 `better-sqlite3`（原生 Node 绑定）和 `node-sqlite3-wasm`（WASM 降级）均已在 commit `ac52fd7` 中移除。
 
 ### 5.2 开发依赖
 
@@ -465,100 +464,129 @@ FTS5 虚拟表 `nodes_fts`（字段：name, qualified_name, docstring, signature
 
 ---
 
-## 6. 当前潜在问题
+## 6. 当前潜在问题（含证据评级）
 
-### 6.1 架构层面
+> **评级说明**
+> - `evidence: high` — 有具体代码行、commit 或文档直接证明
+> - `evidence: medium` — 观察到现象，但后果未在代码中完整验证
+> - `evidence: low` — 推断性判断，缺乏直接代码证据，需进一步读代码确认
+>
+> **判断标准**：行数多不等于设计差。问题的有效依据是：维护摩擦（重复改多处）、测试困难（无法自动验证）、隐式状态（跨模块副作用）、认知负担（读者无法从结构中推断职责）。
 
-**P1 — `src/mcp/tools.ts` 体积过大**  
-单文件 ~15,000 行，包含所有 MCP 工具实现。随功能增长，已超出合理单文件范围，代码导航、测试覆盖、代码审查都变得困难。每次新增工具都需要修改同一个大文件，合并冲突概率高。
+---
 
-**P2 — 无数据流（data-flow）边**  
-文档明确标注：局部变量传递（如 `canvasNonce`）不在图中，属于"已知空白"。对于响应式运行时（Vue Proxy、MobX、Halo `ReactiveExtensionClient`、MediatR）等无静态边的场景，探索直接失效（静默无结果，非报错），Agent 仍需手动 Read。
+### 6.1 有代码证据的真实问题
 
-**P3 — 动态边覆盖原则"部分桥接比不桥接更差"**  
-CLAUDE.md 明确指出：Excalidraw 实测中，只合成 react-render 边（未合成 jsx-child 边）时，Read 次数反而从 9–10 升至 5–10。如果未来有新的框架合成器只覆盖一跳，可能造成 Agent 工具调用数上升而非下降。
+**Q1 — `markSessionConsulted` 将 Claude 特有会话机制耦合进 MCP 工具层**  
+`evidence: high`  
+代码证据：`tools.ts:836–838`，直接读取 `process.env.CLAUDE_SESSION_ID` 并向 `/tmp` 写 session 标记，触发 Claude Code 特有 hook（解锁 Grep/Glob/Bash）。这是 Claude Code 平台行为，与 MCP 协议无关，但混入了工具实现层。Cursor、Codex、opencode 使用同一 MCP 服务器时，这段代码静默跳过但职责越界已成立。修复成本低：将 session 标记逻辑上移至 `MCPServer`（`index.ts`）层或设计成可注入的 hook。
 
-### 6.2 代码质量层面
+**Q2 — `handleStatus` 硬编码 SQLite 后端字符串，不反映运行时状态**  
+`evidence: high`  
+代码证据：`tools.ts:1968` 硬编码 `"node:sqlite (Node built-in) — full WAL + FTS5"`，未动态查询运行时后端。若未来后端再次变更，`codegraph status` 的输出将无声失实。正确做法是从 `DatabaseConnection` 暴露 `getBackendInfo()` 方法并动态调用，而非在工具层编写注释性字符串。
 
-**P4 — 缺少全局 eslint / prettier 配置**  
-项目使用 TypeScript strict 模式，但无 eslint 或 prettier。代码风格一致性依赖人工约定，PR review 中可能产生风格分歧。
+**Q3 — 三处使用指引需人工同步，无自动化验证**  
+`evidence: high`  
+文档证据：CLAUDE.md 明确要求修改工具行为时同步更新 `server-instructions.ts`、`instructions-template.ts`、`.cursor/rules/codegraph.mdc`（"update all three"）。该要求说明三者在历史上曾出现不同步。这是维护摩擦，且无 CI 检测。
 
-**P5 — 无 API 版本兼容性策略**  
-`src/index.ts` 作为库入口，随着功能增加已有大量 re-export，但无 semver-protected 稳定 API 列表。破坏性变更（如修改 `TraversalOptions` 字段）对库的下游用户是无声的。
+**Q4 — `looksLikeFeatureRequest` 关键词表硬编码在工具实现中，无测试和验证**  
+`evidence: high`  
+代码证据：`tools.ts:869–892`，约 24 个硬编码的 feature/bug/exploration 关键词，无对应测试用例，无 A/B 效果验证。这是产品层启发式逻辑混入协议实现层，行为对外不透明，边界情况（如 "swap" 归为 feature）静默误判。
 
-**P6 — `parse-worker.ts` 错误处理粒度粗**  
-Worker 线程解析失败时，错误信息经序列化传回主线程，部分 tree-sitter 解析错误（如 WASM OOM）可能被转换为不明确的错误信息，排查困难。
+**Q5 — evaluation/ 退出 `npm test`，检索质量回归无 CI 保护**  
+`evidence: high`  
+代码证据：`package.json` 中 `"test": "vitest run"` 不含 `__tests__/evaluation/`；CLAUDE.md 明确说 evaluation 需手动运行。后果：新增语言提取器或框架合成器破坏检索质量时，CI 不报警，只有手动执行 `npm run eval` 才能发现。
 
-### 6.3 测试层面
+**Q6 — Windows 验证依赖人工 Parallels VM，CI 无 Windows runner**  
+`evidence: high`  
+文档证据：CLAUDE.md 专有"Windows validation"章节，记录了 VM 连接方式（SSH + PowerShell）。检查 `.github/workflows/` 无 `windows-latest` runner。Windows 特有行为（drive letter、`%APPDATA%`、CRLF、敏感路径 `SENSITIVE_PATHS`）通过 `it.runIf(process.platform === 'win32')` 门控但未在 CI 中运行，依赖维护者人工介入。
 
-**P7 — evaluation/ 不纳入 `npm test`**  
-`__tests__/evaluation/` 需要真实代码库（需网络下载或预置），手动运行 `npm run eval`。新贡献者可能忽略评估步骤，导致检索质量回归未被 CI 发现。
+---
 
-**P8 — Windows 测试门控依赖人工 Parallels VM**  
-Windows 特有行为（drive letter、`%APPDATA%`、CRLF、敏感路径）通过 `it.runIf(process.platform === 'win32')` 门控，但 CI 不跑 Windows runner，实际验证依赖人工连接 Parallels VM。维护成本高，易被遗忘。
+### 6.2 有设计理由的已知约束（不是"问题"）
 
-**P9 — 测试中大量写临时文件到 `fs.mkdtempSync`**  
-每个测试创建真实文件系统 + 真实 SQLite，测试速度受磁盘 I/O 影响明显。在 CI 环境中，42 个测试文件并行跑可能产生资源竞争（特别是 `db-perf.test.ts`）。
+**Q7 — 无数据流（def-use）边，局部变量传递不在图中**  
+`evidence: high`  
+文档证据：CLAUDE.md 明确说"tracking every local would explode the graph"，这是刻意的设计边界，不是疏忽。已知后果（`canvasNonce` 等局部 nonce 需 Agent 手动 Read）已被记录并接受。只有在准备设计探索性实现（需严格控制覆盖范围、避免节点爆炸）时才需要重新评估。
 
-### 6.4 发布流程层面
+**Q8 — 动态边合成须端到端桥接，半成品会使 Agent Read 次数上升**  
+`evidence: high`  
+文档证据：CLAUDE.md 用 Excalidraw 实测数据记录：只合成 react-render 边（未合成 jsx-child 边）时，Read 次数从 9–10 反而升至 5–10。这是未来贡献者需遵循的操作原则，并非当前 bug，但违反原则的 PR 可能造成性能回归。
 
-**P10 — 发布完全依赖 GitHub Actions，无本地验证手段**  
-`scripts/build-bundle.sh` 打包逻辑在 CI 上运行，本地无法完整模拟多平台 bundle 构建。如果 CI 配置有问题，只能等到触发 Release workflow 后才能发现。
+**Q9 — 发布依赖 GitHub Actions，无本地多平台 bundle 验证**  
+`evidence: high`  
+文档证据：CLAUDE.md 明确说"Publishing manually is wrong now"，集中化发布是刻意设计选择。`scripts/build-bundle.sh` 在 CI 多 runner 上并行构建多平台包，本地无法完整复现，但这与主流多平台 npm 包的发布方式相同，属于已接受的工程权衡。
 
-**P11 — `install.sh` 依赖外部 URL（GitHub Releases）**  
-安装脚本从 GitHub Releases 下载预编译 bundle。如果用户网络无法访问 GitHub（如企业内网），安装完全失败，无降级路径（npm 安装是独立流程）。
+**Q10 — 安装脚本依赖 GitHub Releases URL，网络隔离环境无降级**  
+`evidence: medium`  
+代码证据：`install.sh` 使用 `curl` 从 GitHub Releases 下载 bundle；网络中断时无自动降级到 `npm install`。`npm i -g @colbymchenry/codegraph` 是手动替代，但脚本本身不提示。真实影响范围：仅限完全无法访问 GitHub 的网络环境，属于部署场景限制，非通用问题。
 
-### 6.5 文档层面
+---
 
-**P12 — 三处使用指引需手动同步**  
-`src/mcp/server-instructions.ts`、`src/installer/instructions-template.ts`、`.cursor/rules/codegraph.mdc` 内容应保持一致，但无自动化验证。历史上已出现三者不同步的情况。
+### 6.3 证据不足、需进一步验证的推断
+
+**Q11 — `parse-worker.ts` 跨线程错误处理可能损失上下文**  
+`evidence: low`  
+推断：Worker 线程解析失败时，错误需经序列化传回主线程，tree-sitter WASM 的 OOM/段错误类错误可能被降级为字符串。**未读 `parse-worker.ts` 全文，未验证实际错误传递路径**，不宜列为已知问题。
+
+**Q12 — 大量磁盘临时文件写入可能在 CI 中产生 I/O 竞争**  
+`evidence: low`  
+观察：42 个测试文件均用 `fs.mkdtempSync` + 真实 SQLite，理论上存在并发 I/O 竞争。**未实测 CI 环境下的耗时分布，未观察到实际超时或失败**。这是常见 SQLite 测试模式，作为已知问题需要实证，不应凭推断列出。
+
+---
+
+### 关于原 P1 的更正
+
+~~**原 P1 — `src/mcp/tools.ts` 体积过大（已撤销）**~~
+
+原始分析将行数等同于设计问题，这是错误的判断依据。经深度阅读（全文 2,469 行，不是原分析误写的"15,000 行"），tools.ts 是**集中式、有意识的单文件设计**，有以下具体理由支撑：
+
+- **schema 与 handler 共站**：`getTools()` 基于运行时项目大小动态注入 `codegraph_explore` 的预算说明，schema 和实现层的耦合是刻意的，拆文件不能消除它，只能让它变成跨文件隐式依赖
+- **私有辅助函数均为"本地密封"**：`lastQualifierPart`、`numberSourceLines`、`markSessionConsulted` 等模块级函数无导出，各只有单一调用点，移出文件无设计收益
+- **共享状态有功能性理由**：`handleTrace` 内的 `fileCache`（`Map<string, string[]>`）被 `sourceLineAt`/`sourceRangeAt` 共用，保证单次 trace 只读每个文件一次磁盘，这一生命周期语义无法通过跨文件拆分保留
+- **`synthEdgeNote` 是跨工具格式一致性保障**：trace、node、explore 三个工具共用，保证合成边在所有输出中格式相同
+- **公开接口极小**：7 个导出，`ToolHandler` 仅 6 个公开方法，所有 handler 均私有；测试通过 `execute()` 和 `getTools()` 访问，内部组织对测试完全透明
+
+详细分析见 `docs/design-rationale-tools.md`。
 
 ---
 
 ## 7. 建议的后续修改计划
 
-以下计划按优先级从高到低排列，均为局部改动，不影响核心逻辑。
+> 此处仅列出有代码证据支持（evidence: high/medium）的改进方向。推断性问题（Q11/Q12）不纳入，待读代码验证后再决定。
 
-### 优先级 1：可维护性提升（低风险，高收益）
+### 优先级 1：局部手术，成本低、收益明确
 
-**7.1 拆分 `src/mcp/tools.ts`**  
-将 15,000+ 行按工具分组拆分为多个文件：`tools/search.ts`、`tools/trace.ts`、`tools/explore.ts`、`tools/node.ts`、`tools/context.ts` 等，`tools/index.ts` 统一 re-export。不改变任何对外行为，只改文件组织。
+**7.1 将 `markSessionConsulted` 移出工具层**（对应 Q1）  
+将 session 标记逻辑从 `tools.ts` 上移至 `MCPServer`（`src/mcp/index.ts`）层，或设计成可注入的 hook 函数。工具层不再直接读取 `CLAUDE_SESSION_ID`。改动范围：`tools.ts` ~10 行，`index.ts` ~10 行，相关测试小调整。
 
-**7.2 添加 eslint + prettier**  
-加入 `@typescript-eslint/eslint-plugin`（严格规则集）和 prettier，在 `package.json` 加 `"lint"` 脚本，纳入 CI check。可选：添加 `husky` + `lint-staged` pre-commit hook。
+**7.2 自动验证三处使用指引一致性**（对应 Q3）  
+新增测试或独立检查脚本，对比 `server-instructions.ts`、`instructions-template.ts`、`codegraph.mdc` 中的工具列表和关键参数，CI 不一致即失败。消除人工同步负担，防止三者静默漂移。
 
-**7.3 自动验证三处使用指引一致性**  
-新增测试用例（或独立脚本），对比 `server-instructions.ts`、`instructions-template.ts`、`codegraph.mdc` 中的关键段落（工具列表、参数格式），CI 失败即报警，消除人工同步负担。
+**7.3 从 `DatabaseConnection` 动态暴露后端信息供 `handleStatus` 调用**（对应 Q2）  
+`CodeGraph` 类新增 `getBackendInfo(): string` 方法，`handleStatus` 动态调用，不再硬编码字符串。
 
-### 优先级 2：测试与 CI 改善（中等风险）
+### 优先级 2：流程改善，需协调 CI 配置
 
-**7.4 evaluation/ 纳入可选 CI job**  
-在 `.github/workflows/` 新增一个 `eval.yml` workflow，在有标记（如 `[run-eval]` commit message 或 `eval` label）时触发，从 GitHub 克隆测试代码库后运行 `npm run eval`，结果作为 Check 注释输出。
+**7.4 evaluation/ 纳入可选 CI job**（对应 Q5）  
+`.github/workflows/` 新增 `eval.yml`，在特定标签（如 `eval` label 或 `[run-eval]` commit message）触发时，从 GitHub 克隆测试代码库后运行 `npm run eval`，结果输出为 Check 注释。防止检索质量回归静默入库。
 
-**7.5 Windows CI Runner**  
-在 `.github/workflows/` 的测试 job 中加入 `windows-latest` runner，移除对 Parallels VM 的人工依赖。需要处理已知失败项（symlink 权限问题）做合理标注。
+**7.5 CI 添加 Windows runner**（对应 Q6）  
+在测试 workflow 加入 `windows-latest` runner，移除对 Parallels VM 的人工依赖。已知失败项（symlink 权限）用 `it.runIf` 合理标注，不作为 blocker。
 
-**7.6 轻量级数据库 Mock 用于部分测试**  
-对不依赖真实 SQLite 特性的单元测试（如 `query-parser.test.ts`、`search-query-parser.test.ts`），引入内存 SQLite（`:memory:` 模式），减少磁盘 I/O，加快测试速度。
+### 优先级 3：探索性功能，需充分设计再动手
 
-### 优先级 3：功能补全（中等风险）
+**7.6 响应式运行时合成器**（对应 Q8 的前置约束）  
+为 Vue Proxy、MobX 等静默无结果的动态边补充合成器。须遵循 Q8 描述的操作原则：端到端桥接，否则不做。在提交前必须通过 probe 脚本 + 至少 4 run A/B 测试验证。
 
-**7.7 数据流（def-use）边的探索性实现**  
-对局部变量的简单传递（`const x = foo(); bar(x)`），在 TypeScript 提取器中试点提取 `type_of` 边。需严格控制覆盖范围，避免节点爆炸（参考 CLAUDE.md 的"不跟踪每个局部变量"原则）。先做为可选实验特性，用 `--experimental-defuse` flag 控制。
+**7.7 `install.sh` 增加 npm 降级路径**（对应 Q10）  
+网络隔离场景的低优先级改善，增加 `--from-npm` 标志或安装失败时自动提示 npm 替代命令。
 
-**7.8 响应式运行时合成器**  
-为 Vue Proxy、MobX、Halo `ReactiveExtensionClient` 添加合成器，补全"静默无结果"的动态边缺口。遵循 CLAUDE.md 要求：端到端合成，不桥接一半；先用 probe 脚本验证，再提交。
+### 暂缓或存疑
 
-**7.9 npm 离线安装模式**  
-为 `install.sh` 增加 `--from-npm` 标志，在无法访问 GitHub Releases 时自动切换为 `npm i -g @colbymchenry/codegraph`，解决企业内网安装问题。
-
-### 优先级 4：长期架构（高风险，需充分讨论）
-
-**7.10 稳定公共 API 面**  
-在 `src/index.ts` 中显式标注 `@public` / `@internal` 方法，配合 `tsconfig` 生成只包含公共 API 的 `.d.ts`，便于下游库用户升级。
-
-**7.11 MCP 工具版本化**  
-随着工具数量增长，考虑在 MCP `initialize` 响应中加入工具版本号，让 Agent 可以适配不同版本的 codegraph，减少跨版本兼容问题。
+- **`looksLikeFeatureRequest` 关键词表**（Q4）：最简单的处理是删除该逻辑，将 UX 提示改为 `codegraph_context` 的固定后缀；但需要先评估对 Agent 行为的影响，避免无意中降低 context 工具的有效性。
+- **API 版本兼容性策略**（原 P5）：`src/index.ts` 确实有大量 re-export，但无证据表明当前有 breaking change 已伤害下游用户，需先确认实际 npm 库使用场景再决定投入。
+- **拆分 `tools.ts`**：已撤销，详见上方"关于原 P1 的更正"。
 
 ---
 
